@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Universal File Share (STUN + TURN)</title>
+    <!-- PeerJS: Gestisce WebRTC e Handshake -->
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <!-- QRCode.js: Genera il QR -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; text-align: center; padding: 20px; background-color: #f4f4f9; }
+        h1 { color: #2c3e50; }
+        #status { margin: 15px; padding: 10px; background: #e8e8e8; border-radius: 5px; font-weight: bold; }
+        .box { background: white; border: 1px solid #ddd; padding: 20px; margin: 20px auto; max-width: 400px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .hidden { display: none; }
+        #qrcode { display: flex; justify-content: center; margin: 20px; }
+        button { background-color: #3498db; color: white; border: none; padding: 12px 24px; border-radius: 5px; font-size: 16px; cursor: pointer; margin-top: 10px; }
+        button:hover { background-color: #2980b9; }
+        input[type="file"] { margin: 10px 0; }
+        .file-item { background: #ecf0f1; padding: 10px; margin-top: 5px; border-radius: 4px; text-align: left; }
+    </style>
+</head>
+<body>
+
+    <h1>🚀 Share Plus (WiFi & 4G)</h1>
+    <div id="status">Inizializzazione Configurazione...</div>
+
+    <!-- PANNELLO HOST (Chi inizia) -->
+    <div id="host-panel" class="hidden box">
+        <p>Scansiona con l'altro dispositivo (anche in 4G):</p>
+        <div id="qrcode"></div>
+        <p style="font-size: 0.9em; color: #666;">In attesa di connessione...</p>
+    </div>
+
+    <!-- PANNELLO TRASFERIMENTO (Entrambi) -->
+    <div id="transfer-panel" class="hidden box">
+        <h3>✅ Connesso!</h3>
+        <p>Seleziona un file da inviare:</p>
+        <input type="file" id="fileInput">
+        <br>
+        <button onclick="sendFile()">Invia File</button>
+        <hr>
+        <h4>File Ricevuti:</h4>
+        <div id="incoming-files"></div>
+    </div>
+
+    <script>
+        // --- CONFIGURAZIONE POTENZIATA (STUN + TURN) ---
+        // Questa configurazione prova prima la connessione diretta (STUN).
+        // Se fallisce (es. 4G vs WiFi), usa il Relay (TURN) di OpenRelay.
+        const peerConfig = {
+            debug: 2,
+            config: {
+                iceServers: [
+                    // 1. STUN Google (Standard, veloce, ma bloccato dai NAT Simmetrici)
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    
+                    // 2. TURN OpenRelay (Gratuito per test) - Questo è il "paracadute"
+                    // Serve username e password per autorizzare l'uso della banda
+                    {
+                        urls: "turn:openrelay.metered.ca:80",
+                        username: "openrelayproject",
+                        credential: "openrelayproject"
+                    },
+                    {
+                        urls: "turn:openrelay.metered.ca:443",
+                        username: "openrelayproject",
+                        credential: "openrelayproject"
+                    },
+                    {
+                        urls: "turn:openrelay.metered.ca:443?transport=tcp",
+                        username: "openrelayproject",
+                        credential: "openrelayproject"
+                    }
+                ]
+            }
+        };
+
+        let peer = null;
+        let conn = null;
+
+        // Legge l'ID dall'URL (se c'è, siamo Client; se no, siamo Host)
+        const urlParams = new URLSearchParams(window.location.search);
+        const remoteId = urlParams.get('id');
+        const statusEl = document.getElementById('status');
+
+        // Avvio logica
+        if (remoteId) {
+            initPeer(null); // Client: ID automatico
+        } else {
+            const myId = "u-" + Math.floor(Math.random() * 1000000);
+            initPeer(myId); // Host: ID generato
+        }
+
+        function initPeer(id) {
+            // Crea il Peer con la configurazione TURN inclusa
+            peer = new Peer(id, peerConfig);
+
+            peer.on('open', (myId) => {
+                console.log('Mio ID:', myId);
+                
+                if (!remoteId) {
+                    // --- MODALITÀ HOST ---
+                    statusEl.innerText = "Sei l'Host. Scansiona il QR.";
+                    document.getElementById('host-panel').classList.remove('hidden');
+                    
+                    // Genera QR Code con l'URL corrente + ID
+                    const url = window.location.href.split('?')[0] + '?id=' + myId;
+                    new QRCode(document.getElementById("qrcode"), {
+                        text: url,
+                        width: 180,
+                        height: 180
+                    });
+
+                    // Ascolta connessioni in arrivo
+                    peer.on('connection', (connection) => {
+                        setupConnection(connection);
+                    });
+
+                } else {
+                    // --- MODALITÀ CLIENT ---
+                    statusEl.innerText = "Trovato Host. Connessione in corso (potrebbe richiedere qualche secondo)...";
+                    // Prova a connettersi all'Host
+                    const connection = peer.connect(remoteId, {
+                        reliable: true // Usa TCP/Reliable se possibile
+                    });
+                    setupConnection(connection);
+                }
+            });
+
+            // Gestione Errori (Fondamentale per il debug NAT)
+            peer.on('error', (err) => {
+                console.error(err);
+                if (err.type === 'peer-unavailable') {
+                    statusEl.innerText = "Errore: ID Host non trovato o offline.";
+                } else {
+                    statusEl.innerText = "Errore Critico: " + err.type;
+                }
+            });
+        }
+
+        function setupConnection(connection) {
+            conn = connection;
+
+            // Monitoraggio stato connessione ICE (Debugging visivo)
+            peer.on('iceStateChanged', (state) => {
+                console.log("Stato ICE:", state);
+                // Se vedi "connected" o "completed", il NAT è stato bucato!
+            });
+
+            conn.on('open', () => {
+                statusEl.innerText = "🟢 Connessione Stabilita!";
+                statusEl.style.color = "green";
+                
+                // Nascondi QR e mostra pannello file
+                document.getElementById('host-panel').classList.add('hidden');
+                document.getElementById('transfer-panel').classList.remove('hidden');
+            });
+
+            conn.on('data', (data) => {
+                if (data.file && data.name) {
+                    handleReceivedFile(data);
+                }
+            });
+
+            conn.on('close', () => {
+                statusEl.innerText = "🔴 Disconnesso.";
+                statusEl.style.color = "red";
+                alert("L'altro utente si è disconnesso.");
+            });
+            
+            conn.on('error', (err) => {
+                console.error("Errore Connessione:", err);
+                statusEl.innerText = "Errore nel tunnel dati.";
+            });
+        }
+
+        // --- FUNZIONI FILE TRANSFER ---
+        function sendFile() {
+            const fileInput = document.getElementById('fileInput');
+            const file = fileInput.files[0];
+            if (!file) return alert("Seleziona un file!");
+            if (!conn || !conn.open) return alert("Connessione persa!");
+
+            statusEl.innerText = "⏳ Invio " + file.name + "...";
+
+            // Lettura e invio file
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const blob = new Blob([new Uint8Array(e.target.result)], {type: file.type});
+                
+                // Invia oggetto dati
+                conn.send({
+                    file: blob,
+                    name: file.name,
+                    type: file.type
+                });
+                
+                statusEl.innerText = "✅ File inviato con successo!";
+                setTimeout(() => { statusEl.innerText = "🟢 Connesso. Pronto."; }, 2000);
+            };
+            reader.readAsArrayBuffer(file);
+        }
+
+        function handleReceivedFile(data) {
+            statusEl.innerText = "📩 File ricevuto!";
+            
+            const blob = new Blob([data.file], { type: data.type });
+            const url = URL.createObjectURL(blob);
+            
+            const div = document.getElementById('incoming-files');
+            div.innerHTML += `
+                <div class="file-item">
+                    <strong>📄 ${data.name}</strong><br>
+                    <small>${(blob.size / 1024).toFixed(1)} KB</small><br>
+                    <a href="${url}" download="${data.name}"><button style="padding:5px 10px; font-size:12px; margin-top:5px;">Scarica</button></a>
+                </div>
+            `;
+        }
+    </script>
+</body>
+</html>
