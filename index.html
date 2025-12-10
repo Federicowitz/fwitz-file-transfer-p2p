@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P2P File Share (Global)</title>
+    <!-- PeerJS per WebRTC semplificato -->
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <!-- QRCode.js per generare il QR -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <style>
+        body { font-family: sans-serif; text-align: center; padding: 20px; }
+        #status { font-weight: bold; margin: 10px; color: #333; }
+        #qrcode { display: flex; justify-content: center; margin: 20px; }
+        .hidden { display: none; }
+        .box { border: 1px solid #ccc; padding: 20px; margin: 10px auto; max-width: 400px; border-radius: 8px; }
+        button { padding: 10px 20px; font-size: 16px; cursor: pointer; }
+    </style>
+</head>
+<body>
+
+    <h1>Global File Share 🌍</h1>
+    <div id="status">Inizializzazione...</div>
+
+    <!-- Interfaccia HOST (chi invia/riceve per primo) -->
+    <div id="host-panel" class="hidden box">
+        <p>Fai scansionare questo QR all'altro dispositivo:</p>
+        <div id="qrcode"></div>
+        <p>In attesa di connessione...</p>
+    </div>
+
+    <!-- Interfaccia FILE TRANSFER (comune) -->
+    <div id="transfer-panel" class="hidden box">
+        <h3>Connesso! 🚀</h3>
+        <input type="file" id="fileInput">
+        <button onclick="sendFile()">Invia File</button>
+        <hr>
+        <div id="incoming-files"></div>
+    </div>
+
+    <script>
+        // Configurazione ICE Server (STUN di Google per hole punching)
+        const peerConfig = {
+            debug: 2,
+            config: {
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:global.stun.twilio.com:3478' }
+                ]
+            }
+        };
+
+        let peer = null;
+        let conn = null;
+
+        // Controlla se siamo il Client (chi scansiona) o l'Host
+        const urlParams = new URLSearchParams(window.location.search);
+        const remoteId = urlParams.get('id');
+
+        const statusEl = document.getElementById('status');
+
+        if (remoteId) {
+            // --- LOGICA CLIENT (Ha scansionato il QR) ---
+            initPeer(null); // ID automatico
+        } else {
+            // --- LOGICA HOST (Genera il QR) ---
+            // Creiamo un ID breve casuale per comodità
+            const myId = "share-" + Math.floor(Math.random() * 100000);
+            initPeer(myId);
+        }
+
+        function initPeer(id) {
+            // Crea l'oggetto Peer (si connette al server di signaling gratuito di PeerJS)
+            peer = new Peer(id, peerConfig);
+
+            peer.on('open', (myId) => {
+                console.log('Il mio ID è:', myId);
+                
+                if (!remoteId) {
+                    // Siamo l'HOST: Mostra QR Code
+                    statusEl.innerText = "Sei l'HOST. Scansiona il QR.";
+                    document.getElementById('host-panel').classList.remove('hidden');
+                    
+                    const url = window.location.href.split('?')[0] + '?id=' + myId;
+                    new QRCode(document.getElementById("qrcode"), url);
+
+                    // Aspetta che qualcuno si connetta
+                    peer.on('connection', (connection) => {
+                        setupConnection(connection);
+                    });
+
+                } else {
+                    // Siamo il CLIENT: Connettiti all'Host
+                    statusEl.innerText = "Connessione all'Host in corso...";
+                    const connection = peer.connect(remoteId);
+                    setupConnection(connection);
+                }
+            });
+
+            peer.on('error', (err) => {
+                console.error(err);
+                statusEl.innerText = "Errore: " + err.type;
+            });
+        }
+
+        function setupConnection(connection) {
+            conn = connection;
+
+            conn.on('open', () => {
+                statusEl.innerText = "Connessione P2P Stabilita!";
+                document.getElementById('host-panel').classList.add('hidden');
+                document.getElementById('transfer-panel').classList.remove('hidden');
+            });
+
+            conn.on('data', (data) => {
+                // Gestione ricezione dati
+                // Nota: Per file grandi servirebbe uno split in chunk, 
+                // qui gestiamo oggetti semplici o piccoli file blob per demo.
+                if (data.file && data.name) {
+                    handleReceivedFile(data);
+                }
+            });
+
+            conn.on('close', () => {
+                statusEl.innerText = "Connessione chiusa.";
+                document.getElementById('transfer-panel').classList.add('hidden');
+            });
+        }
+
+        // --- INVIO FILE ---
+        function sendFile() {
+            const fileInput = document.getElementById('fileInput');
+            const file = fileInput.files[0];
+            if (!file) return alert("Seleziona un file!");
+
+            if (!conn || !conn.open) return alert("Nessuna connessione!");
+
+            statusEl.innerText = "Invio in corso...";
+            
+            // Convertiamo il file in ArrayBuffer o Blob per inviarlo
+            // Nota: PeerJS gestisce automaticamente la serializzazione binaria
+            // ma per file grandi >1MB è meglio spezzettare (non implementato qui per brevità)
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const blob = new Blob([new Uint8Array(e.target.result)], {type: file.type});
+                
+                conn.send({
+                    file: blob,
+                    name: file.name,
+                    type: file.type
+                });
+                statusEl.innerText = "File inviato!";
+            };
+            reader.readAsArrayBuffer(file);
+        }
+
+        // --- RICEZIONE FILE ---
+        function handleReceivedFile(data) {
+            statusEl.innerText = "File ricevuto: " + data.name;
+            
+            const blob = new Blob([data.file], { type: data.type });
+            const url = URL.createObjectURL(blob);
+            
+            const div = document.getElementById('incoming-files');
+            div.innerHTML += `
+                <div style="margin-top:10px;">
+                    <strong>${data.name}</strong><br>
+                    <a href="${url}" download="${data.name}"><button>Scarica</button></a>
+                </div>
+            `;
+        }
+    </script>
+</body>
+</html>
